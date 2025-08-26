@@ -1,38 +1,47 @@
 blueprint:
-  name: Toggle switches on button press (bidirectional)
+  name: Toggle two switches from Event entities (bidirectional, attribute only)
   description: >
-    Triggered by a button press event. Toggles one switch and mirrors its new state
-    to the other. Optionally add a second trigger to mirror in the opposite direction.
+    Uses state triggers on Event entities (domain: event). When the `event_type`
+    attribute of Event 1 matches the chosen press type, Switch 1 toggles and
+    mirrors to Switch 2. Event 2 does the reverse (toggle Switch 2 then mirror
+    to Switch 1).
   domain: automation
+
   input:
-    entity_1:
-      name: Trigger Entity 1
-      description: The entity_id (e.g. button or remote) that toggles Switch 1 → Switch 2
+    event_entity_1:
+      name: Event entity 1
+      description: Event entity that represents the first button (domain: event)
       selector:
-        entity: {}
-    event_type_1:
-      name: Event type for Entity 1
-      description: The type of event to listen for (e.g. zha_event, deconz_event, etc.)
-      default: zha_event
-      selector:
-        text:
-    entity_2:
-      name: Trigger Entity 2 (optional)
-      description: The entity_id (e.g. button or remote) that toggles Switch 2 → Switch 1
-      default: ""
-      selector:
-        entity: {}
-    event_type_2:
-      name: Event type for Entity 2 (optional)
-      description: The type of event to listen for
-      default: ""
+        entity:
+          domain: event
+
+    press_type_1:
+      name: Event type for Event 1
+      description: The event_type attribute value to react to (e.g., single_press, double_press)
+      default: single_press
       selector:
         text:
+
+    event_entity_2:
+      name: Event entity 2 (reverse direction)
+      description: Event entity that represents the second button (domain: event)
+      selector:
+        entity:
+          domain: event
+
+    press_type_2:
+      name: Event type for Event 2
+      description: The event_type attribute value to react to for Event 2
+      default: single_press
+      selector:
+        text:
+
     switch_1:
       name: Switch 1
       selector:
         entity:
           domain: switch
+
     switch_2:
       name: Switch 2
       selector:
@@ -40,26 +49,28 @@ blueprint:
           domain: switch
 
 trigger:
-  - platform: event
-    event_type: !input event_type_1
-    event_data:
-      entity_id: !input entity_1
-  - platform: event
-    event_type: !input event_type_2
-    event_data:
-      entity_id: !input entity_2
+  - platform: state
+    entity_id: !input event_entity_1
+  - platform: state
+    entity_id: !input event_entity_2
+
+mode: single
 
 action:
   - variables:
-      switch1: !input switch_1
-      switch2: !input switch_2
-      trigger_entity: "{{ trigger.event.data.entity_id }}"
-      entity1: !input entity_1
-      entity2: !input entity_2
+      e1: !input event_entity_1
+      e2: !input event_entity_2
+      t1: !input press_type_1
+      t2: !input press_type_2
+      ev_attr_type: "{{ trigger.to_state.attributes.event_type if trigger.to_state is defined else '' }}"
+      fired_entity: "{{ trigger.entity_id }}"
 
   - choose:
-      # Case 1: Triggered by Entity 1 → Toggle Switch 1, mirror to Switch 2
-      - conditions: "{{ trigger_entity == entity1 }}"
+
+      # Case 1: Event entity 1 fired with matching attribute
+      - conditions:
+          - condition: template
+            value_template: "{{ fired_entity == e1 and ev_attr_type == t1 }}"
         sequence:
           - choose:
               - conditions:
@@ -68,47 +79,12 @@ action:
                     state: "on"
                 sequence:
                   - service: switch.turn_off
-                    target:
-                      entity_id: !input switch_1
+                    target: { entity_id: !input switch_1 }
                   - service: switch.turn_off
-                    target:
-                      entity_id: !input switch_2
+                    target: { entity_id: !input switch_2 }
               - conditions:
                   - condition: state
                     entity_id: !input switch_1
                     state: "off"
                 sequence:
                   - service: switch.turn_on
-                    target:
-                      entity_id: !input switch_1
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input switch_2
-
-      # Case 2: Triggered by Entity 2 → Toggle Switch 2, mirror to Switch 1
-      - conditions: "{{ trigger_entity == entity2 and entity2 != '' }}"
-        sequence:
-          - choose:
-              - conditions:
-                  - condition: state
-                    entity_id: !input switch_2
-                    state: "on"
-                sequence:
-                  - service: switch.turn_off
-                    target:
-                      entity_id: !input switch_2
-                  - service: switch.turn_off
-                    target:
-                      entity_id: !input switch_1
-              - conditions:
-                  - condition: state
-                    entity_id: !input switch_2
-                    state: "off"
-                sequence:
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input switch_2
-                  - service: switch.turn_on
-                    target:
-                      entity_id: !input switch_1
-
