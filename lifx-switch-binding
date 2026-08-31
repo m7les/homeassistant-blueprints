@@ -1,0 +1,228 @@
+# blueprints/automation/local/lifx_switch_binding.yaml
+#
+# Supersedes lifx_switch_button.yaml and lifx_switch_wired.yaml.
+#
+# The two cases are the same shape with the authority in a different place:
+#
+#   DETACHED  authority = the light or light group
+#             followers = the relay indicators on every switch fronting it
+#             the button commands the authority; HA holds the truth
+#
+#   ATTACHED  authority = the relay (hardware toggles it, you cannot outvote it)
+#             followers = the other real lights in the room
+#             the button only PREDICTS; the relay's report holds the truth
+#
+# Everything downstream is identical: followers are driven one-way from the
+# authority, every write is guarded by a difference check, and the pair is
+# reconciled on HA start and hourly.
+#
+# Picking the wrong mode is the main way to get this wrong:
+#   detached mode on an attached relay -> the press toggles the load in
+#     hardware AND this automation toggles it again: a race.
+#   attached mode on a detached relay  -> the press does nothing at all,
+#     because nothing ever commands the load.
+
+blueprint:
+  name: LIFX switch button binding (detached or attached relay)
+  description: >
+    Binds one LIFX switch button to one authoritative entity and keeps a set
+    of follower entities in step with it. Works for detached relays (light
+    is authoritative, relay is an indicator) and attached relays (relay is
+    authoritative, other lights follow), selected by Relay mode.
+  domain: automation
+  input:
+    button:
+      name: Button event entity
+      selector:
+        entity:
+          filter:
+            domain: event
+
+    relay_mode:
+      name: Relay mode
+      description: >
+        detached — the button commands the authority.
+        attached — hardware commands the authority; the button only predicts.
+      default: detached
+      selector:
+        select:
+          options:
+            - detached
+            - attached
+
+    authority:
+      name: Authoritative entity
+      description: >
+        detached — the light or light group this button owns.
+        attached — the relay entity itself.
+      selector:
+        entity:
+          filter:
+            domain: [light, switch]
+
+    followers:
+      name: Followers
+      description: >
+        detached — relay indicators, one per switch fronting this light.
+        attached — the other real lights to keep in step with the relay.
+        Never include the authority itself.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            domain: [light, switch]
+
+    head_start:
+      name: Predict from the button event (attached mode only)
+      description: >
+        Move followers on the button event instead of waiting for the relay
+        to report. Faster; occasionally wrong for a few hundred ms, always
+        corrected by the reconcile branch.
+      default: true
+      selector:
+        boolean:
+
+    double_target:
+      name: Double press target
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            domain: [light, switch]
+
+    long_press_actions:
+      name: Long press actions
+      default: []
+      selector:
+        action:
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  relay_mode: !input relay_mode
+  authority: !input authority
+  followers: !input followers
+  head_start: !input head_start
+  double_target: !input double_target
+
+triggers:
+  # If your HA build lacks `event.received`, substitute a single
+  #   - trigger: state
+  #     entity_id: !input button
+  #     not_to: ["unavailable", "unknown"]
+  # and branch on trigger.to_state.attributes.event_type.
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [single_press]
+    id: single
+
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [double_press]
+    id: double
+
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [long_press]
+    id: long
+
+  # No `from:` restriction, so this also catches the authority coming back
+  # from unavailable.
+  - trigger: state
+    entity_id: !input authority
+    to: ["on", "off"]
+    id: sync
+
+  - trigger: homeassistant
+    event: start
+    id: start
+
+  - trigger: time_pattern
+    hours: "/1"
+    id: heal
+
+actions:
+  - choose:
+
+      # ---- detached: the button commands the authority ----
+      # Followers are not touched here. The sync branch picks up the
+      # resulting state change and moves them.
+      - conditions:
+          - condition: trigger
+            id: single
+          - condition: template
+            value_template: "{{ relay_mode == 'detached' }}"
+        sequence:
+          - action: homeassistant.toggle
+            target:
+              entity_id: "{{ authority }}"
+
+      # ---- attached: the button only predicts ----
+      # The guess is the inverse of the relay's current state. Nothing here
+      # is authoritative; the sync branch corrects a bad guess when the
+      # relay actually reports.
+      - conditions:
+          - condition: trigger
+            id: single
+          - condition: template
+            value_template: >
+              {{ relay_mode == 'attached' and head_start
+                 and followers | count > 0
+                 and states(authority) in ['on', 'off'] }}
+        sequence:
+          - variables:
+              want: "{{ 'off' if is_state(authority, 'on') else 'on' }}"
+          - action: "homeassistant.turn_{{ want }}"
+            target:
+              entity_id: "{{ followers }}"
+
+      - conditions:
+          - condition: trigger
+            id: double
+          - condition: template
+            value_template: "{{ double_target | count > 0 }}"
+        sequence:
+          - action: homeassistant.toggle
+            target:
+              entity_id: "{{ double_target }}"
+
+      - conditions:
+          - condition: trigger
+            id: long
+        sequence: !input long_press_actions
+
+      # ---- authority -> followers, both modes ----
+      - conditions:
+          - condition: trigger
+            id: [sync, start, heal]
+        sequence:
+          # Let the integrations connect before trusting any state.
+          - delay: "{{ 60 if trigger.id == 'start' else 0 }}"
+          - condition: template
+            value_template: >
+              {{ followers | count > 0
+                 and states(authority) in ['on', 'off'] }}
+          - variables:
+              want: "{{ states(authority) }}"
+          - repeat:
+              for_each: "{{ followers }}"
+              sequence:
+                - if:
+                    - condition: template
+                      value_template: >
+                        {{ states(repeat.item) not in ['unavailable', 'unknown']
+                           and states(repeat.item) != want }}
+                  then:
+                    - action: "homeassistant.turn_{{ want }}"
+                      target:
+                        entity_id: "{{ repeat.item }}"
