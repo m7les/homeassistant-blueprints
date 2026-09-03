@@ -1,0 +1,230 @@
+# blueprints/automation/local/lifx_button.yaml
+#
+# ONE INSTANCE PER PHYSICAL BUTTON. That is the whole scheme.
+#
+# Gestures are per button, so the instance is per button. Mirroring hangs
+# off the AUTHORITY's state, not off any button, so it fires correctly no
+# matter which instance happens to contain it. That means duplication is
+# safe here: fill `followers` on every button that controls the same
+# authority. Extra copies cost one guarded no-op run each and buy you the
+# absence of a hidden dependency — no instance is secretly load-bearing for
+# another, and deleting a button cannot silently stop the mirroring.
+#
+# authority   the entity holding the true state: the light or light group
+#             when nothing is hard-wired, or the attached relay when a dumb
+#             load is wired to a switch (hardware wins, the group follows).
+#
+# wired       true only for the one button physically switching the
+#             authority. It then predicts instead of commanding, because
+#             commanding would fight the hardware. Every other button on
+#             the same authority leaves this false.
+#
+# indicators  detached relays whose only job is to show the authority's
+#             state. ALWAYS forced to match, including at start and hourly
+#             heal, because an indicator that disagrees is simply wrong.
+#
+# followers   real lights brought into line WHEN THE AUTHORITY CHANGES, and
+#             then left alone. They are not re-asserted at heal, so an 11pm
+#             all-off, a scene, or a dimmer press can move them without this
+#             automation dragging them back within the hour.
+#
+#             If you want a light strictly slaved to the authority with no
+#             independent control, list it as an indicator instead. That
+#             choice is per room and this is where you make it.
+#
+# Never list the authority itself in either.
+
+blueprint:
+  name: LIFX button
+  description: >
+    One LIFX switch button, with its own double and long press actions, and
+    optional one-way mirroring of its authority onto a set of followers.
+  domain: automation
+  input:
+    button:
+      name: Button event entity
+      selector:
+        entity:
+          filter:
+            domain: event
+
+    authority:
+      name: Authoritative entity
+      selector:
+        entity:
+          filter:
+            domain: [light, switch]
+
+    wired:
+      name: This button is hard-wired to the authority
+      default: false
+      selector:
+        boolean:
+
+    indicators:
+      name: Indicators
+      description: >
+        Optional. Detached relays showing the authority's state. Always
+        enforced, including at start and hourly heal. Safe to repeat across
+        every button instance for this authority.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            domain: [light, switch]
+
+    followers:
+      name: Followers
+      description: >
+        Optional. Real lights moved when the authority changes, then left
+        alone. Not re-asserted at heal, so they stay independently
+        controllable.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            domain: [light, switch]
+
+    double_target:
+      name: Double press target
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            domain: [light, switch]
+
+    long_press_actions:
+      name: Long press actions
+      default: []
+      selector:
+        action:
+
+mode: queued
+max: 10
+max_exceeded: silent
+
+variables:
+  authority: !input authority
+  wired: !input wired
+  indicators: !input indicators
+  followers: !input followers
+  double_target: !input double_target
+
+triggers:
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [single_press]
+    id: single
+
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [double_press]
+    id: double
+
+  - trigger: event.received
+    target:
+      entity_id: !input button
+    options:
+      event_type: [long_press]
+    id: long
+
+  # No `from:` restriction, so this also catches the authority returning
+  # from unavailable.
+  - trigger: state
+    entity_id: !input authority
+    to: ["on", "off"]
+    id: sync
+
+  - trigger: homeassistant
+    event: start
+    id: start
+
+  - trigger: time_pattern
+    hours: "/1"
+    id: heal
+
+actions:
+  - choose:
+
+      # Not hard-wired: command the authority. The sync branch below then
+      # moves the followers.
+      - conditions:
+          - condition: trigger
+            id: single
+          - condition: template
+            value_template: "{{ not wired }}"
+        sequence:
+          - action: homeassistant.toggle
+            target:
+              entity_id: "{{ authority }}"
+
+      # Hard-wired: hardware already switched it, so only predict. A wrong
+      # guess is corrected by the sync branch when the relay reports.
+      - conditions:
+          - condition: trigger
+            id: single
+          - condition: template
+            value_template: >
+              {{ wired and (followers + indicators) | count > 0
+                 and states(authority) in ['on', 'off'] }}
+        sequence:
+          - variables:
+              want: "{{ 'off' if is_state(authority, 'on') else 'on' }}"
+          - action: "homeassistant.turn_{{ want }}"
+            target:
+              entity_id: "{{ followers + indicators }}"
+
+      - conditions:
+          - condition: trigger
+            id: double
+          - condition: template
+            value_template: "{{ double_target | count > 0 }}"
+        sequence:
+          - action: homeassistant.toggle
+            target:
+              entity_id: "{{ double_target }}"
+
+      - conditions:
+          - condition: trigger
+            id: long
+        sequence: !input long_press_actions
+
+      # ---------------- authority -> followers / indicators ----------------
+      # On an authority change, move everything. On start or heal, touch
+      # indicators ONLY — re-asserting real lights here would undo any
+      # legitimate independent change, such as a scheduled all-off.
+      - conditions:
+          - condition: trigger
+            id: [sync, start, heal]
+        sequence:
+          # Let the integrations connect before trusting any state.
+          - delay: "{{ 60 if trigger.id == 'start' else 0 }}"
+          - variables:
+              targets: >
+                {{ indicators if trigger.id in ['start', 'heal']
+                   else followers + indicators }}
+          - condition: template
+            value_template: >
+              {{ targets | count > 0
+                 and states(authority) in ['on', 'off'] }}
+          - variables:
+              want: "{{ states(authority) }}"
+          - repeat:
+              for_each: "{{ targets }}"
+              sequence:
+                - if:
+                    - condition: template
+                      value_template: >
+                        {{ states(repeat.item) not in ['unavailable', 'unknown']
+                           and states(repeat.item) != want }}
+                  then:
+                    - action: "homeassistant.turn_{{ want }}"
+                      target:
+                        entity_id: "{{ repeat.item }}"
