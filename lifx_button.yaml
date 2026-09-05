@@ -14,6 +14,10 @@
 #             when nothing is hard-wired, or the attached relay when a dumb
 #             load is wired to a switch (hardware wins, the group follows).
 #
+#             Optional. Leave it empty for a button that only carries
+#             gestures — the single press, mirroring, sync and heal paths
+#             all no-op and double and long press still work.
+#
 # wired       true only for the one button physically switching the
 #             authority. It then predicts instead of commanding, because
 #             commanding would fight the hardware. Every other button on
@@ -22,6 +26,10 @@
 # indicators  detached relays whose only job is to show the authority's
 #             state. ALWAYS forced to match, including at start and hourly
 #             heal, because an indicator that disagrees is simply wrong.
+#             After a press they are written even when they already look
+#             correct: a detached relay toggles its own reported state when
+#             pressed, so that read is stale and the difference check would
+#             skip precisely the write that fixes it.
 #
 # followers   real lights brought into line WHEN THE AUTHORITY CHANGES, and
 #             then left alone. They are not re-asserted at heal, so an 11pm
@@ -50,8 +58,15 @@ blueprint:
 
     authority:
       name: Authoritative entity
+      description: >
+        Optional. The entity holding the true state. Leave empty for a
+        button that exists only to carry double or long press gestures —
+        the mirroring, sync and heal paths then do nothing at all. Pick at
+        most one; if more than one is given, only the first is used.
+      default: []
       selector:
         entity:
+          multiple: true
           filter:
             domain: [light, switch]
 
@@ -102,12 +117,26 @@ blueprint:
       selector:
         action:
 
-mode: queued
-max: 10
+# Parallel, not queued: the press branches end with a short wait for the
+# authority to report, and queueing would make a second press sit behind
+# that wait. Every write is guarded and idempotent, so concurrent runs
+# converge rather than fight.
+mode: parallel
+max: 25
 max_exceeded: silent
 
 variables:
-  authority: !input authority
+  authority_in: !input authority
+  # The authority selector is `multiple` purely so it can be left empty.
+  # Accept both shapes: an instance created before that change stores a
+  # plain string, and `| first` on a string yields its first character.
+  authority: >
+    {{ authority_in if authority_in is string
+       else (authority_in | first if authority_in | count > 0 else '') }}
+  # Guard every use of `authority`. With no authority the single press,
+  # sync, start, heal and tail paths all no-op, leaving a gesture-only
+  # button: double and long press still work.
+  has_authority: "{{ authority | length > 0 }}"
   wired: !input wired
   indicators: !input indicators
   followers: !input followers
@@ -159,7 +188,7 @@ actions:
           - condition: trigger
             id: single
           - condition: template
-            value_template: "{{ not wired }}"
+            value_template: "{{ has_authority and not wired }}"
         sequence:
           - action: homeassistant.toggle
             target:
@@ -172,7 +201,8 @@ actions:
             id: single
           - condition: template
             value_template: >
-              {{ wired and (followers + indicators) | count > 0
+              {{ has_authority and wired
+                 and (followers + indicators) | count > 0
                  and states(authority) in ['on', 'off'] }}
         sequence:
           - variables:
@@ -212,19 +242,91 @@ actions:
                    else followers + indicators }}
           - condition: template
             value_template: >
-              {{ targets | count > 0
+              {{ has_authority and targets | count > 0
                  and states(authority) in ['on', 'off'] }}
           - variables:
               want: "{{ states(authority) }}"
+              # On `sync` the press has just happened and a detached relay
+              # may still be reporting its own local toggle, so our read of
+              # an INDICATOR is stale and the difference check would skip
+              # the one write that matters. Turning a switch on when it is
+              # already on is a no-op at the device and produces no state
+              # change, so there is nothing to loop on.
+              #
+              # Only indicators need this. Nothing this button does moves a
+              # follower in hardware, so a follower's read is never stale in
+              # the same way, and re-asserting turn_on onto a light that is
+              # already on risks disturbing its level.
+              force: "{{ trigger.id == 'sync' }}"
           - repeat:
               for_each: "{{ targets }}"
               sequence:
+                # Availability is checked separately from the difference:
+                # `force` must not reach a dead entity, because a raising
+                # service call aborts the run and every target after this
+                # one in the list would go unwritten.
                 - if:
                     - condition: template
                       value_template: >
                         {{ states(repeat.item) not in ['unavailable', 'unknown']
-                           and states(repeat.item) != want }}
+                           and (states(repeat.item) != want
+                                or (force and repeat.item in indicators)) }}
                   then:
                     - action: "homeassistant.turn_{{ want }}"
                       target:
                         entity_id: "{{ repeat.item }}"
+
+  # ---------------- tail reconcile after a press ----------------
+  # A prediction is optimistic. If the authority did NOT end up changing —
+  # a press that toggled it back, a double press consuming two toggles, a
+  # command that never landed — then no state trigger fires and nothing
+  # corrects the guess. It would sit wrong until the hourly heal. So after
+  # any press, wait briefly for the authority to report, then re-assert
+  # from its actual state.
+  # The gate names exactly what the tail would write, so a button with
+  # followers but no indicators does not sit through the wait to do nothing.
+  - if:
+      - condition: trigger
+        id: [single, double, long]
+      - condition: template
+        value_template: >
+          {{ has_authority
+             and (indicators | count > 0
+                  or (wired and trigger.id == 'single'
+                      and followers | count > 0)) }}
+    then:
+      # On a NON-wired press the authority usually reports while the toggle
+      # above is still being awaited, before this listener exists, so the
+      # full timeout elapses. That is fine — the read below is then simply
+      # the settled value. The wait earns its keep on a wired press, where
+      # the relay's report genuinely arrives after this point.
+      - wait_for_trigger:
+          - trigger: state
+            entity_id: !input authority
+            to: ["on", "off"]
+        timeout: "00:00:03"
+        continue_on_timeout: true
+      - variables:
+          tail: >
+            {{ indicators + (followers
+               if (wired and trigger.id == 'single') else []) }}
+          settled: "{{ states(authority) }}"
+      - condition: template
+        value_template: "{{ settled in ['on', 'off'] }}"
+      - repeat:
+          for_each: "{{ tail }}"
+          sequence:
+            # Same split as the sync branch: indicators are written even
+            # when they look correct, because after a press that read is
+            # stale. This is the step that recovers a pair which started
+            # out of sync. Followers stay difference-guarded.
+            - if:
+                - condition: template
+                  value_template: >
+                    {{ states(repeat.item) not in ['unavailable', 'unknown']
+                       and (states(repeat.item) != settled
+                            or repeat.item in indicators) }}
+              then:
+                - action: "homeassistant.turn_{{ settled }}"
+                  target:
+                    entity_id: "{{ repeat.item }}"

@@ -32,6 +32,7 @@ Create an instance only for:
 | Button controls something other than its own relay | `authority` = that entity, `wired: false` |
 | Button controls a group | `authority` = a switch-group helper, `wired: false` |
 | Button needs a double or long press gesture | `authority` = whatever it controls, gestures filled in |
+| Button is *only* a gesture — it controls nothing | `authority` empty, gestures filled in |
 | Button toggles its own load *and* brings the room along | `wired: true`, `followers` = the other relays |
 | A spare or detached gang should display another light's state | `indicators` = that relay |
 
@@ -40,7 +41,7 @@ Create an instance only for:
 | Input | Meaning |
 |---|---|
 | `button` | The `event.*` entity for this one button |
-| `authority` | The entity holding the true state |
+| `authority` | The entity holding the true state. Optional — leave empty for a gesture-only button. Pick at most one |
 | `wired` | True only if this button switches the authority in hardware |
 | `indicators` | Display-only relays. Always forced to match, including at hourly heal |
 | `followers` | Real lights moved when the authority changes, then left alone |
@@ -51,6 +52,22 @@ Create an instance only for:
 is wrong and gets corrected. A follower may have been changed for a good
 reason — a scene, a schedule — so it is never re-asserted at heal. Slave a
 light strictly by listing it as an indicator.
+
+The split also decides how hard each is written. A detached relay toggles
+its own reported state when pressed, so immediately after a press our read
+of it is stale and a difference check would skip the write that fixes it.
+Indicators are therefore written even when they already look correct.
+Followers are not: nothing this button does moves them in hardware, so
+their read is trustworthy, and re-asserting `turn_on` onto a light that is
+already on risks disturbing its level.
+
+Every press also ends with a short reconcile: wait up to three seconds for
+the authority to report, then re-assert from its actual state. This covers
+the cases where the authority ends where it began — a double press
+consuming two toggles, a command that never landed — so no state change
+fires and nothing else would correct the guess. The hourly heal is then
+back to its proper job: catching a missed notification or a device that
+reconnected quietly, not covering for the press path.
 
 ### Things to be careful of
 
